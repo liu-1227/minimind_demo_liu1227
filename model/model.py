@@ -8,30 +8,39 @@ class MokioMindConfig(PretrainedConfig):
 
     def __init__(
         self,
-        dropout: float = 0.0,
-        bos_token_id: int = 1,
-        eos_token_id: int = 2,
-        hidden_act: str = "silu",
+
+        ######特殊token id#######
+        bos_token_id: int = 1,#句子开始标记
+        eos_token_id: int = 2,#句子结束标记
+
+        ######基础transformer参数#######
         hidden_size: int = 512,
-        intermediate_size: int = None,
-        max_position_embeddings: int = 32768,
-        num_attention_heads: int = 8,
         num_hidden_layers: int = 8,
+        num_attention_heads: int = 8,
+        max_position_embeddings: int = 32768,
+        dropout: float = 0.0,
+        hidden_act: str = "silu",
+        intermediate_size: int = None,#FFN中间层维度（4*4）
+        rms_norm_eps: float = 1e-05,#归一化层的数值稳定常数
+
+        ######GQA（分组查询注意力）#######
         num_key_value_heads: int = 2,
+
+        ######RoPE（旋转位置编码）#######
         vocab_size: int = 6400,
-        rms_norm_eps: float = 1e-05,
-        rope_theta: int = 1000000,
-        inference_rope_scaling: bool = False,
-        flash_attention: bool = True,
+        rope_theta: int = 1000000,#基础频率
+        inference_rope_scaling: bool = False,#长度扩展
+        flash_attention: bool = True,#动态扩展
+
         ############ MoE（混合专家） ############
         use_moe: bool = False,
         num_experts_per_tok: int = 2,
         n_routed_experts: int = 4,
         n_shared_experts: int = 1,
         scoring_func: str = "softmax",
-        aux_loss_alpha: float = 0.01,
-        seq_aux: bool = True,
-        norm_topk_prob: bool = True,
+        aux_loss_alpha: float = 0.01,#堵在均衡损失权重
+        seq_aux: bool = True,#序列级辅助损失
+        norm_topk_prob: bool = True,#归一化 top-k 概率
         **kwargs,
     ):
         super().__init__(**kwargs)
