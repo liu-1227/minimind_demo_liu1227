@@ -82,7 +82,7 @@ class MokioMindConfig(PretrainedConfig):
             else None
         )
 
-
+############################ RMSNorm ###############################
 import torch
 import torch.nn as nn
 
@@ -101,8 +101,9 @@ class RMSNorm(nn.Module):
     def forward(self, x):
         return self.weight * self.norm(x.float()).type_as(x)
 
+############################ RoPE&YaRN ###############################
 import math
-from typing import Optional
+from typing import Optional,Tuple
 def preconpute_freqs_cis(dim:int,
                          end:int(32*1024),
                          rope_base,#RoPE基础频率
@@ -184,6 +185,141 @@ def apply_rotary_pos_emb(q,k,cos,sin,position_ids=None,unsqueeze_dim=1):
     k_embed = ((k * cos.unsqueeze(unsqueeze_dim)) +
                 (rotate_half(k)*sin.unsqueeze(unsqueeze_dim)))
     return q_embed,k_embed
+
+
+############################ GQA ###############################
+#多次获取kv
+def repeat_kv(x:torch.Tensor,n_rep:int) -> torch.Tensor:
+    bs,slen,num_key_value_heads,heads_dim = x.shape
+    if n_rep == 1:
+        return x
+    return (
+        x[:,:, :,None, :]#增加维度None
+        .expand(bs,slen,num_key_value_heads,n_rep,heads_dim)#扩展张量n_rep
+        .reshape(bs,slen,num_key_value_heads*n_rep,heads_dim)#重塑形状，合并维度
+    )
+
+from torch.nn import functional as F
+class Attention(nn.Module):
+    def __init__(self,args:MokioMindConfig):
+        super().__init__()
+        #kv头数量(MHA)
+        self.num_key_value_heads = args.num_attention_heads \
+            if args.num_key_value_heads is None \
+            else args.num_key_value_heads
+
+        #assert条件若为假，则会报错AssertionError
+        #分组前提：注意力头数可以被kv头数整除
+        assert args.num_attention_heads % self.num_key_value_heads == 0
+        "num_key_value_heads must be divisible by num_attention_heads"
+
+        #分组计算
+        self.n_local_heads = args.num_attention_heads
+        self.num_key_value_heads = args.num_key_value_heads
+        self.n_rep = self.n_local_heads // self.num_key_value_heads
+
+        #每个头的维度
+        self.head_dim = args.hidden_size // args.num_attention_heads
+
+        #线性投影层
+        self.q_proj = nn.Linear(args.hidden_size,args.num_attention_heads * self.head_dim,bias = False)
+        self.k_proj = nn.Linear(args.hidden_size,self.num_key_value_heads * self.head_dim,bias = False)
+        self.v_proj = nn.Linear(args.hidden_size,self.num_key_value_heads * self.head_dim,bias = False)
+
+        self.o_proj = nn.Linear(args.num_attention_heads * self.head_dim, args.hidden_size,bias = False)#将多头输出映射到原始维度
+
+        #Dropout层
+        self.atten_dropout = nn.Dropout(args.dropout)
+        self.resid_dropout = nn.Dropout(args.dropout)
+        self.dropout = args.dropout
+
+        #是否支持flsah
+        self.flash = hasattr(torch.nn.functional,"scaled_dot_product_attention") and args.flash_attention
+
+    #forward方法
+    def forward(self,
+        x:torch.Tensor,
+        position_embdding:Tuple[torch.Tensor,torch.Tensor],
+        past_key_value : Optional[Tuple[torch.Tensor,torch.Tensor]] = None,
+        use_cache = False,
+        attention_mask : Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        #线性投影并重塑为多头格式
+        #投影，计算qkv
+        bsz, seq_len, _ = x.shape # [batch, seq_len, hidden_size]
+        xq = self.q_proj(x) #hidden_size=n_local_heads * head_dim
+        xk = self.k_proj(x) #hidden_size=num_kv_heads * head_dim
+        xv = self.v_proj(x)
+
+        #把输入拆封成多个头，view将最后一个维度拆成两个
+        xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
+        xv = xv.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
+
+        #q,k --> RoPE
+        cos,sin = position_embdding
+            #为qk添加位置信息
+        xq,xk = apply_rotary_pos_emb(xq,xk,cos[:seq_len],sin[:seq_len])
+
+        #k,v --> repeat（注意kv cache）
+        #kv缓存处理，用于自回归生成
+        if past_key_value is not None:
+            xk = torch.cat([past_key_value[0],xk],dim=1)
+            xv = torch.cat([past_key_value[1],xv],dim=1)
+        past_kv = (xk,xv) if use_cache else None#保存用于下一步
+        #重复kv，并调整维度顺序
+        #维度转置：[bsz, seq_len, heads, dim] -> [bsz, heads, seq_len, dim]
+        xq = xq.transpose(1, 2)  # [bsz, n_local_heads, seq_len, head_dim]
+        #重复kv头：
+        # [bsz, num_kv_heads, seq_len, dim] -> [bsz, n_local_heads, seq_len, dim]（通过重复）
+        xk = repeat_kv(xk,self.n_rep).transpose(1, 2)
+        xv = repeat_kv(xv,self.n_rep).transpose(1, 2)
+
+
+        #进行attention计算，
+        #内置实现
+        if self.flash and seq_len>1 and (attention_mask is None or torch.all(attention_mask ==1)):
+            #注意力扩展掩码
+            attn_mask = (
+                None
+                if attention_mask is None
+                else attention_mask.view(bsz,1,1,-1).expand(bsz,self.n_local_heads,seq_len,-1).bool()
+            )
+            output = F.scaled_dot_product_attention(
+                xq,xk,xv,
+                attn_mask=attn_mask,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=True#因果掩码，不能看到未来
+            )
+        #自己定义，手动实现
+        else:
+            #注意力分数：（q*k^T）/sqart(d)
+            scores = (xq@xk.transpose(-2,-1)/math.sqrt(self.head_dim))
+            # [bsz, heads, seq_len, seq_len]
+
+            #添加因果掩码（下三角矩阵）
+            scores = scores + torch.triu(
+                torch.full((seq_len,seq_len),float('-inf'),device=scores.device),
+                diagonal = 1
+            ).unsqueeze(0).unsqueeze(0)
+
+        #拼接头，输出投影并返回
+            #添加自定义注意力源码
+            if attention_mask is not None:
+                extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+                extended_attention_mask = (1.0 - extended_attention_mask) * 1e9
+                scores = scores + extended_attention_mask
+            #softmax+dropout
+            scores = F.softmax(scores.float(),dim=-1).type_as(xq)
+            scores = self.attn_dropout(scores)
+            output = scores@xv
+
+        #调整维度：[bsz, heads, seq_len, dim] -> [bsz, seq_len, heads*dim]
+        output = output.transpose(1,2).reshape(bsz,seq_len,-1)
+        # 最终投影：heads*dim -> hidden_size
+        output = self.resid_dropout(self.o_proj(output))
+        return output,past_kv
+
 
 
 
