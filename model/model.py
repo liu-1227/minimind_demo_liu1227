@@ -321,7 +321,30 @@ class Attention(nn.Module):
         return output,past_kv
 
 
+from transformers.activations import ACT2FN
+class FeedForward(nn.Module):
+    def __init__(self,args:MokioMindConfig):
+        #初始化
+        super().__init__()
+        #计算并设置FFN升维维度
+        if args.intermediate_size is None:
+            intermediate_size = int(args.hidden_size * 8/3)
+            args.intermediate_size = 64*((intermediate_size+64-1)//64)
+        #升维
+        self.up_proj = nn.Linear(args.hidden_size,args.intermediate_size,bias = False)
+        #激活函数
+        self.act_fn = ACT2FN[args.hidden_act]
+        #门控
+        self.gate_proj = nn.Linear(args.hidden_size,args.intermediate_size,bias = False)
+        #降维
+        self.down_proj = nn.Linear(args.intermediate_size,args.hidden_size,bias=False)
+        #dropout
+        self.dropout = nn.Dropout(args.dropout)
 
+    def forward(self,x):
+        return self.dropout(
+            self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x) )
+        )
 
 
 
